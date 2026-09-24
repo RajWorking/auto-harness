@@ -39,7 +39,7 @@ run benchmark → analyze → improve agent/agent.py → gate → record → upd
 
 Before running the initialization command in your chosen quick start:
 
-- [ ] **Choose one benchmark and install its prerequisites:** [Terminal-Bench 2.0](#quick-start-terminal-bench-20) needs the `harbor` CLI and a configured sandbox provider (or a running Docker daemon for `env_provider: "docker"`); [BIRD-Interact](#quick-start-bird-interact) needs Python 3.12+, Docker, `git-lfs`, and access to the ground-truth data described below; [tau-bench](#quick-start-tau-bench) uses Docker Compose and the image built by `docker compose build autoeval`.
+- [ ] **Choose one benchmark and install its prerequisites:** [Terminal-Bench 2.0](#quick-start-terminal-bench-20) needs the `harbor` CLI and a configured sandbox provider (or a running Docker daemon for `env_provider: "docker"`); [BIRD-Interact](#quick-start-bird-interact) needs Python 3.12+, Docker, `git-lfs`, and access to the ground-truth data described below; [tau-bench](#quick-start-tau-bench) uses Docker Compose and the image built by `docker compose build`.
 - [ ] **Configure the experiment:** copy [`experiment_config.yaml.template`](experiment_config.yaml.template) to `experiment_config.yaml`, uncomment only the benchmark section you intend to use, and review its models, dataset/domain, and `max_concurrency`. The template is entirely commented out, so copying it alone does not select a benchmark.
 - [ ] **Set credentials for the selected models and provider:** use [`.env.example`](.env.example) as a reference. For Terminal-Bench, supply the credential for the selected `env_provider`; Docker needs no sandbox-provider key, but model API credentials are still required. For BIRD-Interact, check both `agent_model` and `user_model`.
 - [ ] **Make credentials available to the process:** Docker Compose loads `.env` via `env_file`. When running `python prepare.py` directly, export the required variables in your shell first; `prepare.py` does not load `.env` automatically. For a shell-compatible `.env` you have reviewed, Bash/Zsh users can run `set -a; source .env; set +a` from the repository root.
@@ -145,7 +145,7 @@ cp experiment_config.yaml.template experiment_config.yaml
 # edit experiment_config.yaml — uncomment the tau-bench section
 
 # 4. Build the Docker image (installs tau-bench and all deps via uv)
-docker compose build autoeval
+docker compose build
 
 # 5. Initialize the workspace + run baseline
 docker compose run autoeval python prepare.py
@@ -281,9 +281,8 @@ record.py                   appends iteration result to results.tsv
 PROGRAM.md                  loop instructions for the coding agent (copied from template)
 program_templates/          benchmark-specific PROGRAM.md templates
 experiment_config.yaml.template   example configs for each benchmark
-Dockerfile                  container definition (tau-bench; `service` target for service/)
-docker-compose.yml          autoeval (profile `loop`), plus postgres, api, and worker for service/
-test_client.py              submits a job to service/ and prints its result and history
+Dockerfile                  container definition (tau-bench)
+docker-compose.yml          mounts agent/ and workspace/ (tau-bench)
 workspace/
   suite.json                regression eval suite (task IDs + threshold)
   learnings.md              per-run log: patterns, what worked, requests to human
@@ -301,166 +300,3 @@ workspace/
 - **Learnings close the feedback loop.** After each iteration the agent writes `workspace/learnings.md`: what it tried, what worked, what it needs from the human.
 - **Gate everything.** No change is committed without passing both the eval suite and the full test score gate.
 - **Structural anti-cheating.** Test traces are not saved to disk. The coding agent can only read train traces.
-
----
-
-## Agent optimization service
-
-`service/` is an HTTP service that benchmarks an agent on Terminal-Bench tasks and improves it with a meta-agent. It is separate from the coding-agent loop above. It runs Harbor through `TerminalBenchRunner` from `benchmark.py`, inside an E2B sandbox.
-
-### Run
-
-The service optimizes 1 agent: the git repo at `agent_store/agent`. Put the agent there before starting the service. To use this repo's Terminal-Bench agent as a 1-file repo:
-
-```bash
-mkdir -p agent_store/agent
-cp agent/templates/terminal_bench.py agent_store/agent/agent.py
-git -C agent_store/agent init --initial-branch=main
-git -C agent_store/agent add agent.py
-git -C agent_store/agent commit -m "Terminal-Bench agent"
-```
-
-Any other agent works the same way: `git clone <url> agent_store/agent`.
-
-Put `E2B_API_KEY` and `OPENAI_API_KEY` in `.env`, then start the stack:
-
-```bash
-docker compose up -d --build
-```
-
-This starts 3 containers:
-
-- `postgres`
-
-- `api` on `http://localhost:8000`, with interactive docs at `/docs`
-
-- `worker`, which runs queued jobs
-
-On startup, the worker builds the E2B template `auto-harness-runner` in your E2B account. The first build takes about 1 minute. Later builds reuse E2B's cache.
-
-Submit a job, poll it, and print the result and iteration history:
-
-```bash
-pip install httpx
-python test_client.py --max-iterations 3 --tasks crack-7z-hash pypi-server
-```
-
-`test_client.py --help` lists the options. By default it optimizes `agent:HarnessAgent` at `main` on all tasks in `service/tasks.yaml`.
-
-Worker settings, all optional:
-
-- `AGENT_MODEL`: the model the agent uses. Default `gpt-5.4`.
-
-- `OPTIMIZER_MODEL`: the meta-agent's model. Default `gpt-5.4`. It must be an OpenAI chat model with tool calling.
-
-### API
-
-```
-POST /jobs                   queue a job; returns 202 and the job
-GET  /jobs/{id}              status, latest commit and result, stop reason
-GET  /jobs/{id}/iterations   every iteration: commit, parent, meta-agent analysis, diff, result
-GET  /jobs/{id}/transcript   the meta-agent's conversation: every message, tool call, and tool output
-```
-
-`POST /jobs` body:
-
-```json
-{
-  "agent": {
-    "ref": "main",
-    "entrypoint": "agent:HarnessAgent"
-  },
-  "task_ids": ["crack-7z-hash", "pypi-server"],
-  "max_iterations": 3,
-  "target_score": 0.8
-}
-```
-
-- `ref` is a branch, tag, or commit in `agent_store/agent`. `entrypoint` is a Harbor import path from the repository root.
-
-- `task_ids` defaults to all tasks in `service/tasks.yaml`.
-
-- `max_iterations` (0 to 10, default 0) is the number of meta-agent improvement rounds after the first run.
-
-- `target_score` (above 0, up to 1, default 1) is the pass rate that ends the loop early.
-
-Job `status` is `queued`, `running`, `completed`, or `crashed`. `crashed` means the service could not produce a result, for example because Harbor produced no output. Failed tasks are part of a `completed` job. Each task in `result.tasks` is `passed` (reward 0.5 or more), `failed`, or `error` (no verifier result). Failed and errored tasks carry the tail of their test or error output.
-
-`stop_reason` is `target_score` when the latest iteration's score reached `target_score`, and `max_iterations` otherwise.
-
-### Tasks
-
-[`service/tasks.yaml`](service/tasks.yaml) names the Harbor dataset (`terminal-bench@2.0`) and 20 default tasks. We picked them in 2 steps:
-
-1. We considered medium and hard tasks with an agent timeout of 900s or less. We left out tasks that download models, need 4G of memory, run QEMU, or have expert estimates of 8 hours or more. From those, we picked 20. They include the 4 tasks the agent failed in an earlier 15-task run, `overfull-hbox` (easy) among them. They exclude the 11 tasks it passed.
-
-2. We ran this repo's Terminal-Bench agent on the 20 tasks in E2B 3 times, all at the same commit. It scored 0.50, 0.40, and 0.35. In the first run, 8 tasks failed their tests. 2 (`crack-7z-hash` and `query-optimize`) errored because the agent does not catch E2B's timeout on a command that runs over 120s.
-
-The set covers 10 categories: 15 tasks are medium, 4 are hard, and 1 is easy. Expert time estimates range from 5 to 180 minutes, with a median of 60. The tasks the agent fails give the optimizer something to fix. The tasks it passes catch regressions.
-
-Harbor runs all tasks of a job in parallel and applies each task's own timeouts from its `task.toml`. `TerminalBenchRunner` kills Harbor after 1 hour as a last resort.
-
-### Design
-
-- **Agents are git commits.** The operator places the agent repo at `agent_store/agent`, which compose bind-mounts into the api and worker. The API resolves `ref` in that repo and pins the job to the commit. Each meta-agent change is a new commit on top of the commit the meta-agent chose. Its message holds the meta-agent's analysis. Postgres stores only commit hashes. Ref `refs/jobs/<job_id>/<index>` keeps every iteration's commit, so `git log refs/jobs/<job_id>/<index>` and `git diff` work on the host. Back up `agent_store` together with Postgres.
-
-- **Postgres is the queue.** `POST /jobs` inserts a `queued` row. The worker claims the oldest one with `SELECT ... FOR UPDATE SKIP LOCKED`. The API and worker share only Postgres and the agent store.
-
-- **3 tables** in `service/schemas.py`. `jobs` holds the request, status, and stop reason. `iterations` holds 1 row per benchmark run: commit, parent commit, and result. `meta_messages` holds the meta-agent's conversation, 1 row per message, appended as each message is added. The meta-agent can read `jobs` and `iterations` of every job.
-
-- **Loop.** The worker benchmarks the base commit as iteration 0. Then it runs a meta-agent: an OpenAI tool-calling loop in `service/optimizer.py`. Each iteration, the meta-agent gets a fresh E2B sandbox with a git checkout of the agent repo. It has 2 tools:
-
-  - `bash` runs in the checkout, in the sandbox. The worker uploads a git bundle of every ref in the agent repo, so the meta-agent can read every commit and diff. The sandbox gets no API keys and no database URL.
-
-  - `sql` runs 1 read-only statement on Postgres as the role `meta_agent`. The role can read only `jobs` and `iterations`. The meta-agent can compare per-task results across commits and jobs.
-
-  The meta-agent keeps 1 conversation for the whole job. It starts by reading the agent's code and control flow. Each iteration adds 1 message: the previous iteration's outcome and the commit the checkout is at. The service keeps no notion of a best commit. The meta-agent reads commits and scores from git and the database, decides which commit to build on, and checks it out. It edits any files and ends with a text reply. The sandbox commits the checkout on top of the checked-out commit, with that reply as the message. The worker fetches the new commit into the agent repo as a git bundle, deletes the sandbox, and benchmarks the commit. Every change is committed and benchmarked, and the next iteration's checkout starts at the new commit. An attempt that fails or changes no files uses up its iteration without a commit, and the next checkout starts at the previous commit. The loop stops when an iteration's score reaches `target_score` or after `max_iterations` iterations. The system prompt reuses the failure checklist and the known techniques from [`program_templates/terminal_bench.md`](program_templates/terminal_bench.md).
-
-- **Sandbox boundary.** The worker runs no agent code. For each benchmark run, `service/runner.py` does 4 things:
-
-  1. It creates 1 outer E2B sandbox from the template `auto-harness-runner`: Python 3.12, git, and `harbor[e2b]==0.23.0`. The sandbox gets only `E2B_API_KEY` and `OPENAI_API_KEY`.
-
-  2. It uploads the commit as a tar, `benchmark.py`, and `service/sandbox_run.py`.
-
-  3. It runs `sandbox_run.py` in the sandbox. That script runs Harbor, which creates 1 E2B sandbox per task. The agent's Python code (its LLM loop) runs in the Harbor process in the outer sandbox. Its commands and the verifier run in the task sandboxes. Harbor deletes each task sandbox when its task ends.
-
-  4. It reads `report.json` (rewards and output tails) back and kills the outer sandbox.
-
-- **Agent load errors.** Before Harbor starts, `sandbox_run.py` imports the entrypoint in the outer sandbox. If the import fails, every task gets status `error` with the traceback, and Harbor does not run. A change that breaks the import then scores 0, and the meta-agent can read why in the database.
-
-### Not implemented
-
-- **Multi-tenancy.** There are no orgs, users, or API keys yet.
-
-- **Context limits.** The meta-agent's conversation grows with every tool call for the whole job. Bash output is cut to 8000 characters per call. SQL output is never cut. A long job can still exceed the model's context window, and every later iteration then fails. Summarizing earlier iterations would fix this.
-
-- **Agent secrets and results.** The agent's code runs in the same outer sandbox as Harbor. It can read `E2B_API_KEY` and `OPENAI_API_KEY`, and it could overwrite Harbor's result files. Fixing this needs a model proxy with per-run keys, and the verifier's results read from outside the outer sandbox.
-
-- **Several agents.** The service has 1 agent repo. Supporting several needs an agent ID in the request and 1 repo per agent.
-
-- **Multiple workers.** On startup, the worker marks every `running` job as `crashed`, so only 1 worker may run. Leases with heartbeats would allow several.
-
-- **Sandbox cleanup after a kill.** E2B deletes the outer sandbox 70 minutes after it starts, even if the worker died. Harbor creates task sandboxes with a 24-hour lifetime. If Harbor is killed mid-run, its task sandboxes keep running until E2B stops them.
-
-### With more time
-
-- Worker leases, retries, and job cancellation.
-
-- Held-out tasks to detect overfitting, and several attempts per task to reduce noise.
-
-- Keep each run's Harbor trial logs so the meta-agent can read the agent's full trajectories. It sees only the tail of each failed task's output now.
-
-- Alembic migrations. Tables are created on startup, so a schema change needs a fresh database.
-
-### Test
-
-Requires pip 25.1 or newer for `--group`.
-
-```bash
-python -m venv .venv
-.venv/bin/pip install --group service
-docker compose up -d postgres
-.venv/bin/python -m pytest service/tests
-```
-
-Tests use a separate `harness_test` database and create it if missing. They replace Harbor and the meta-agent's model with stubs, so they need no API keys.
