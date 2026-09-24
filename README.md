@@ -430,7 +430,7 @@ Harbor runs all tasks of a job in parallel and applies each task's own timeouts 
 
 ### Not implemented
 
-- **Multi-tenancy (Milestone 5).** There are no orgs, users, or API keys yet.
+- **Multi-tenancy.** There are no orgs, users, or API keys yet.
 
 - **Context limits.** The meta-agent's conversation grows with every tool call for the whole job. Bash output is cut to 8000 characters per call. SQL output is never cut. A long job can still exceed the model's context window, and every later iteration then fails. Summarizing earlier iterations would fix this.
 
