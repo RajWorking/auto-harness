@@ -152,6 +152,8 @@ class TerminalBenchRunner(BenchmarkRunner):
         per_task_timeout: int = 1200,
         jobs_dir: str = "workspace/tbench_jobs",
         reasoning_effort: str | None = None,
+        agent_dir: str | None = None,
+        subprocess_timeout: int | None = None,
     ):
         self.agent_model = agent_model or os.getenv("AGENT_MODEL", "gpt-5.4")
         self.split = split
@@ -162,6 +164,10 @@ class TerminalBenchRunner(BenchmarkRunner):
         self.per_task_timeout = per_task_timeout
         self.jobs_dir = jobs_dir
         self.reasoning_effort = reasoning_effort
+        # Directory Harbor imports the agent from. Defaults to this repo.
+        self.agent_dir = agent_dir or os.path.dirname(os.path.abspath(__file__))
+        # Overrides the computed `harbor run` timeout below.
+        self.subprocess_timeout = subprocess_timeout
 
     def _load_split_tasks(self) -> list[str] | None:
         """Load task names for the configured split. Returns None to run all tasks."""
@@ -218,8 +224,7 @@ class TerminalBenchRunner(BenchmarkRunner):
 
         # Set PYTHONPATH so Harbor can import the agent module
         env = os.environ.copy()
-        repo_root = os.path.dirname(os.path.abspath(__file__))
-        env["PYTHONPATH"] = repo_root + os.pathsep + env.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = self.agent_dir + os.pathsep + env.get("PYTHONPATH", "")
         env["AGENT_MODEL"] = self.agent_model  # explicit — don't rely on parent env
         if self.reasoning_effort:
             env["AGENT_REASONING_EFFORT"] = self.reasoning_effort
@@ -233,7 +238,7 @@ class TerminalBenchRunner(BenchmarkRunner):
         import math
         n_tasks = len(task_ids) if task_ids else 150  # conservative upper bound for full dataset
         n_batches = math.ceil(n_tasks / max(n, 1))
-        timeout_sec = self.per_task_timeout * n_batches + 300
+        timeout_sec = self.subprocess_timeout or self.per_task_timeout * n_batches + 300
         print(f"[benchmark] running {n_tasks} terminal-bench tasks "
               f"(model={self.agent_model}, env={self.env_provider}, "
               f"n={n}, per_task_timeout={self.per_task_timeout}s, "

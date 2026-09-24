@@ -34,3 +34,6 @@ tau2_data/
 
 # BIRD-Interact-ADK (auto-cloned by prepare.py, not committed)
 bird_interact_adk/
+
+# agent repo optimized by service/ (the operator places it at agent_store/agent)
+agent_store/

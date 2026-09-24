@@ -1,0 +1,24 @@
+# Harbor dataset and the tasks the service runs by default.
+# Category, difficulty, and agent timeout come from each task's task.toml.
+dataset: terminal-bench@2.0
+tasks:
+  - overfull-hbox               # debugging, easy, 750s
+  - crack-7z-hash               # security, medium, 900s
+  - raman-fitting               # scientific-computing, medium, 900s
+  - polyglot-c-py               # software-engineering, medium, 900s
+  - fix-code-vulnerability      # security, hard, 900s
+  - password-recovery           # security, hard, 900s
+  - polyglot-rust-c             # software-engineering, hard, 900s
+  - cancel-async-tasks          # software-engineering, hard, 900s
+  - query-optimize              # data-science, medium, 900s
+  - pypi-server                 # software-engineering, medium, 900s
+  - git-leak-recovery           # software-engineering, medium, 900s
+  - build-pmars                 # software-engineering, medium, 900s
+  - log-summary-date-ranges     # data-processing, medium, 900s
+  - headless-terminal           # software-engineering, medium, 900s
+  - sqlite-db-truncate          # debugging, medium, 900s
+  - db-wal-recovery             # file-operations, medium, 900s
+  - largest-eigenval            # mathematics, medium, 900s
+  - chess-best-move             # games, medium, 900s
+  - git-multibranch             # system-administration, medium, 900s
+  - adaptive-rejection-sampler  # scientific-computing, medium, 900s
