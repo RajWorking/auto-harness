@@ -1,11 +1,13 @@
 import subprocess
 import sys
 import uuid
+from pathlib import Path
 
 from service import store
 from service.config import TASK_IDS
 from service.schemas import SessionLocal, TaskResult, TaskStatus
-from service.worker import claim_job, execute_job
+from service.worker import claim_job, run_job
+from service.tests.conftest import LocalBox
 
 TASKS = TASK_IDS[:3]
 
@@ -26,23 +28,22 @@ class LineCountRunner:
 
 
 def scripted_meta_agent(*steps):
-    """A stub meta-agent class. Each iteration runs the next step: `step(workdir)` edits the checkout and
-    returns the analysis. `messages` records what the worker sent. Like MetaAgent, it records its
-    conversation: 1 user and 1 assistant message per iteration."""
+    """A stub meta-agent class. Each iteration runs the next step: `step(workdir)` edits the checkout's
+    directory in the LocalBox and returns the analysis. `messages` records what the worker sent. Like
+    MetaAgent, it records its conversation: 1 user and 1 assistant message per iteration."""
 
     class Scripted:
         instances = 0
         messages: list[str] = []
 
-        def __init__(self, workdir, record):
+        def __init__(self, record):
             Scripted.instances += 1
-            self.workdir = workdir
             self.record = record
 
-        def run(self, message):
+        def run(self, message, work):
             Scripted.messages.append(message)
             self.record({"role": "user", "content": message})
-            analysis = steps[len(Scripted.messages) - 1](self.workdir)
+            analysis = steps[len(Scripted.messages) - 1](Path(work.path))
             self.record({"role": "assistant", "content": analysis})
             return analysis
 
@@ -62,10 +63,10 @@ def run_worker_once(runner=None, meta_agent=None):
     with SessionLocal() as session:
         job = claim_job(session)
         assert job is not None
-        execute_job(session, job, runner or LineCountRunner(), meta_agent or _no_meta_agent)
+        run_job(session, job, runner or LineCountRunner(), meta_agent or _no_meta_agent, LocalBox)
 
 
-def _no_meta_agent(workdir, record):
+def _no_meta_agent(record):
     raise AssertionError("meta-agent created")
 
 
@@ -301,25 +302,15 @@ def test_crashed_job_has_no_stop_reason(client, agent_repo):
     assert len(client.get(f"/jobs/{job_id}/iterations").json()) == 1
 
 
-def test_import_error_reports_broken_agent(tmp_path):
-    from service.runner import _import_error
-
-    (tmp_path / "good.py").write_text("class Agent: pass\n")
-    (tmp_path / "broken.py").write_text("class Agent(:\n")
-    assert _import_error(tmp_path, "good:Agent") is None
-    assert "AttributeError" in _import_error(tmp_path, "good:Missing")
-    assert "SyntaxError" in _import_error(tmp_path, "broken:Agent")
-
-
 def test_failed_transcript_write_does_not_break_the_job(client, agent_repo):
     class RecordsNul:
-        def __init__(self, workdir, record):
-            self.workdir, self.record = workdir, record
+        def __init__(self, record):
+            self.record = record
 
-        def run(self, message):
+        def run(self, message, work):
             self.record({"role": "tool", "content": "a\x00b"})  # Postgres rejects NUL in JSONB
             self.record({"role": "assistant", "content": "fix"})
-            return append("# improved\n", "fix")(self.workdir)
+            return append("# improved\n", "fix")(Path(work.path))
 
     job_id = submit(client, task_ids=TASKS, max_iterations=1)
     run_worker_once(LineCountRunner(), RecordsNul)

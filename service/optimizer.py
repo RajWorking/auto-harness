@@ -1,25 +1,16 @@
 import json
-import os
-import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
 from openai import OpenAI
-
 from sqlalchemy import create_engine
 
 from service.config import META_DB_PASSWORD, META_DB_USER, OPTIMIZER_MODEL
 from service.schemas import META_AGENT_TABLES, Base, engine
-from service.store import OPTIMIZER_IDENTITY
+from service.checkout import Checkout
 
 MAX_STEPS = 40  # tool-calling rounds per iteration
 OUTPUT_CHARS = 8000  # bash output kept per call
-BASH_TIMEOUT_SEC = 120
-# The meta-agent's shell gets no API keys and no database URL.
-BASH_ENV = {
-    **{k: os.environ[k] for k in ("PATH", "HOME", "LANG") if k in os.environ},
-    **OPTIMIZER_IDENTITY,
-}
 # The `sql` tool connects as the meta-agent's role, so Postgres rejects every table outside META_AGENT_TABLES.
 meta_engine = create_engine(engine.url.set(username=META_DB_USER, password=META_DB_PASSWORD), pool_pre_ping=True)
 # Guidance written for the repo's coding-agent loop (see prepare.py), reused here.
@@ -53,11 +44,12 @@ In each iteration:
 1. Decide which commit to build on from the commits and their benchmark results, and check it out
    with `git checkout --detach <commit>`. After an iteration, the checkout is at that iteration's commit.
 2. Edit any files to make the agent better. Do not commit yourself. Put scratch files outside the checkout.
+   Each iteration starts in a fresh sandbox, so files outside the checkout do not carry over.
 3. Reply without a tool call. The service commits the checkout on top of the commit you checked out,
    and benchmarks it. The result appears in the database.
 
 Tools:
-- bash: runs in the checkout. Every version is kept under refs/jobs/<job_id>/<index>, and
+- bash: runs in the checkout, in a sandbox with Python 3.12, git, and Harbor. Every version is kept under refs/jobs/<job_id>/<index>, and
   `git log --all`, `git show <commit>:<path>`, and `git diff` work. The message of each
   optimizer commit is the analysis of that attempt.
 - sql: 1 read-only statement on the service's Postgres. Tables:
@@ -107,20 +99,22 @@ TOOLS = [
 
 
 class MetaAgent:
-    """A tool-using LLM that improves the agent in `workdir`. It keeps 1 conversation for the whole job.
+    """A tool-using LLM that improves the agent. It keeps 1 conversation for the whole job.
 
     `record` receives every message as it is added to the conversation.
     """
 
-    def __init__(self, workdir: Path, record: Callable[[dict], None]):
-        self.workdir = workdir
+    def __init__(self, record: Callable[[dict], None]):
         self.record = record
         self.messages: list[dict] = []
         self.client = OpenAI()
         self._add({"role": "system", "content": SYSTEM_PROMPT})
 
-    def run(self, message: str) -> str:
-        """Add `message` to the conversation and work until the model replies without a tool call. Return that reply."""
+    def run(self, message: str, work: Checkout) -> str:
+        """Add `message` to the conversation and work in `work` until the model replies without a tool call.
+
+        Return that reply.
+        """
         self._add({"role": "user", "content": message})
         for _ in range(MAX_STEPS):
             reply = self.client.chat.completions.create(model=OPTIMIZER_MODEL, messages=self.messages, tools=TOOLS)
@@ -131,36 +125,24 @@ class MetaAgent:
                     raise ValueError("empty final reply")
                 return msg.content
             for call in msg.tool_calls:
-                self._add({"role": "tool", "tool_call_id": call.id, "content": self._tool(call)})
+                self._add({"role": "tool", "tool_call_id": call.id, "content": self._tool(call, work)})
         raise RuntimeError(f"no final reply after {MAX_STEPS} steps")
 
     def _add(self, message: dict) -> None:
         self.messages.append(message)
         self.record(message)
 
-    def _tool(self, call) -> str:
+    def _tool(self, call, work: Checkout) -> str:
         # Never raises: every tool call needs a reply, or the conversation becomes invalid for later iterations.
         try:
             args = json.loads(call.function.arguments)
             if call.function.name == "bash":
-                return _truncate(bash(self.workdir, args["command"]))
+                return _truncate(work.bash(args["command"]))
             if call.function.name == "sql":
                 return sql(args["query"])
             return f"unknown tool {call.function.name!r}"
         except Exception as e:
             return f"error: {type(e).__name__}: {e}"
-
-
-def bash(workdir: Path, command: str) -> str:
-    try:
-        proc = subprocess.run(
-            ["bash", "-c", command], cwd=workdir, env=BASH_ENV,
-            capture_output=True, text=True, errors="replace", timeout=BASH_TIMEOUT_SEC,
-        )
-    except subprocess.TimeoutExpired:
-        return f"timed out after {BASH_TIMEOUT_SEC}s"
-    # Postgres cannot store NUL in JSONB, and every tool output goes to meta_messages.
-    return f"{proc.stdout}{proc.stderr}[exit code {proc.returncode}]".replace("\x00", "")
 
 
 def sql(query: str) -> str:

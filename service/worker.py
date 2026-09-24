@@ -8,11 +8,11 @@ import time
 from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
-from service import optimizer, store
+from service import checkout, optimizer, store
 from service.schemas import (
     AgentSource, Iteration, Job, JobCreate, JobStatus, MetaMessage, RunResult, SessionLocal, TaskStatus, init_db,
 )
-from service.runner import HarborRunner
+from service.runner import HarborRunner, build_sandbox_template
 
 POLL_SEC = 2
 
@@ -28,7 +28,9 @@ def claim_job(session: Session) -> Job | None:
     return job
 
 
-def execute_job(session: Session, job: Job, runner: HarborRunner, meta_agent=optimizer.MetaAgent) -> None:
+def run_job(
+    session: Session, job: Job, runner: HarborRunner, meta_agent=optimizer.MetaAgent, box_factory=checkout.E2BBox,
+) -> None:
     """Benchmark the agent, then let the meta-agent change it until an iteration's score reaches
     `target_score` or `max_iterations` iterations have run.
 
@@ -37,9 +39,9 @@ def execute_job(session: Session, job: Job, runner: HarborRunner, meta_agent=opt
     try:
         request = JobCreate.model_validate(job.request)
         latest = _benchmark(runner, request.agent, job.base_commit, request.task_ids)
-        _record(session, job, 0, job.base_commit, None, latest)
+        _save_iteration(session, job, 0, job.base_commit, None, latest)
         if request.max_iterations and latest.score < request.target_score:
-            latest = _optimize(session, job, request, runner, meta_agent, latest)
+            latest = _optimize(session, job, request, runner, meta_agent, box_factory, latest)
         job.stop_reason = "target_score" if latest.score >= request.target_score else "max_iterations"
         job.status = JobStatus.completed
     except Exception as e:
@@ -49,47 +51,49 @@ def execute_job(session: Session, job: Job, runner: HarborRunner, meta_agent=opt
     session.commit()
 
 
-def _optimize(session: Session, job: Job, request: JobCreate, runner: HarborRunner, meta_agent, latest: RunResult) -> RunResult:
+def _optimize(
+    session: Session, job: Job, request: JobCreate, runner: HarborRunner, meta_agent, box_factory, latest: RunResult,
+) -> RunResult:
     """Run the improvement iterations. Return the latest benchmark result.
 
-    The meta-agent keeps 1 conversation and 1 checkout for the whole job. Each iteration adds 1 message
-    to the conversation. The meta-agent picks the commit to build on by checking it out. Every change
-    is committed on top of the checked-out commit and benchmarked.
+    The meta-agent keeps 1 conversation for the whole job. Each iteration adds 1 message to it and gives
+    the meta-agent a fresh sandbox with a checkout of the agent repo. The meta-agent picks the commit to
+    build on by checking it out. Every change is committed on top of the checked-out commit and benchmarked.
     """
-    with store.worktree(job.base_commit) as workdir:
-        transcript = _Transcript(job.id)
-        meta = meta_agent(workdir, transcript)
-        outcome = (
-            f"Job {job.id}. Entrypoint `{request.agent.entrypoint}`. Tasks: {', '.join(request.task_ids)}.\n"
-            f"Iteration 0, commit {job.base_commit}, scored {latest.score:.2f}. Target score: {request.target_score}."
+    transcript = _TranscriptWriter(job.id)
+    meta = meta_agent(transcript)
+    head = job.base_commit
+    outcome = (
+        f"Job {job.id}. Entrypoint `{request.agent.entrypoint}`. Tasks: {', '.join(request.task_ids)}.\n"
+        f"Iteration 0, commit {job.base_commit}, scored {latest.score:.2f}. Target score: {request.target_score}."
+    )
+    for index in range(1, request.max_iterations + 1):
+        transcript.iteration = index
+        message = (
+            f"{outcome}\nIteration {index} of {request.max_iterations}: the checkout is at commit "
+            f"{head}. Check out the commit you want to build on, then make your change."
         )
-        for index in range(1, request.max_iterations + 1):
-            transcript.iteration = index
-            message = (
-                f"{outcome}\nIteration {index} of {request.max_iterations}: the checkout is at commit "
-                f"{store.head(workdir)}. Check out the commit you want to build on, then make your change."
-            )
+        with checkout.open_checkout(head, box_factory) as work:
             try:
-                analysis = meta.run(message)
+                analysis = meta.run(message, work)
+                committed = work.commit(analysis, store.iteration_ref(job.id, index))
             except Exception as e:
                 # A failed attempt uses up the iteration. It has no commit, so it has no iterations row.
-                store.reset_worktree(workdir, "HEAD")
                 outcome = f"Iteration {index} failed and was not benchmarked: {type(e).__name__}: {e}"
                 continue
-            if (committed := store.commit_worktree(workdir, analysis, store.iteration_ref(job.id, index))) is None:
-                outcome = f"Iteration {index} changed no files, so it was not benchmarked."
-                continue
-            commit, parent = committed
-            store.reset_worktree(workdir, commit)
-            latest = _benchmark(runner, request.agent, commit, request.task_ids)
-            _record(session, job, index, commit, parent, latest)
-            outcome = f"Iteration {index}, commit {commit} on parent {parent}, scored {latest.score:.2f}."
-            if latest.score >= request.target_score:
-                break
+        if committed is None:
+            outcome = f"Iteration {index} changed no files, so it was not benchmarked."
+            continue
+        head, parent = committed
+        latest = _benchmark(runner, request.agent, head, request.task_ids)
+        _save_iteration(session, job, index, head, parent, latest)
+        outcome = f"Iteration {index}, commit {head} on parent {parent}, scored {latest.score:.2f}."
+        if latest.score >= request.target_score:
+            break
     return latest
 
 
-class _Transcript:
+class _TranscriptWriter:
     """Appends each meta-agent message to `meta_messages` as soon as it is added to the conversation.
 
     Each write uses its own session. A failed write loses that row only: the job's session and the
@@ -117,13 +121,14 @@ def _benchmark(runner: HarborRunner, agent: AgentSource, commit: str, task_ids: 
     return RunResult(score=sum(t.status == TaskStatus.passed for t in tasks) / len(tasks), tasks=tasks)
 
 
-def _record(session: Session, job: Job, index: int, commit: str, parent: str | None, result: RunResult) -> None:
+def _save_iteration(session: Session, job: Job, index: int, commit: str, parent: str | None, result: RunResult) -> None:
     session.add(Iteration(job_id=job.id, index=index, commit=commit, parent=parent, result=result.model_dump(mode="json")))
     session.commit()
 
 
 def main() -> None:
     init_db()
+    build_sandbox_template()
     runner = HarborRunner()
     with SessionLocal() as session:
         # A running job at startup was interrupted by a worker restart.
@@ -139,7 +144,7 @@ def main() -> None:
                 time.sleep(POLL_SEC)
                 continue
             print(f"job {job.id}: running", flush=True)
-            execute_job(session, job, runner)
+            run_job(session, job, runner)
             print(f"job {job.id}: {job.status}", flush=True)
 
 

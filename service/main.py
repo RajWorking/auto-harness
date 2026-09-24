@@ -26,7 +26,7 @@ def create_job(body: JobCreate, session: Session = Depends(get_session)) -> JobO
     job_id = uuid.uuid4()
     try:
         # Git first, then Postgres: a failed insert leaves only an unused ref behind.
-        commit = store.pin(body.agent.ref, store.iteration_ref(job_id, 0))
+        commit = store.pin_ref(body.agent.ref, store.iteration_ref(job_id, 0))
     except store.GitError as e:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, f"unknown ref: {e}")
     job = Job(id=job_id, status=JobStatus.queued, request=body.model_dump(), base_commit=commit)
@@ -38,21 +38,21 @@ def create_job(body: JobCreate, session: Session = Depends(get_session)) -> JobO
 
 @app.get("/jobs/{job_id}", response_model=JobOut)
 def get_job(job_id: uuid.UUID, session: Session = Depends(get_session)) -> JobOut:
-    return _job_out(session, _get_job(session, job_id))
+    return _job_out(session, _job_or_404(session, job_id))
 
 
 @app.get("/jobs/{job_id}/iterations", response_model=list[IterationOut])
 def list_iterations(job_id: uuid.UUID, session: Session = Depends(get_session)) -> list[IterationOut]:
     """Full history: each iteration's commit and parent, the meta-agent's analysis and diff, and its benchmark result."""
-    _get_job(session, job_id)
+    _job_or_404(session, job_id)
     iterations = session.scalars(select(Iteration).where(Iteration.job_id == job_id).order_by(Iteration.index))
     return [
         IterationOut(
             index=it.index,
             commit=it.commit,
-            analysis=store.message(it.commit) if it.index else None,
+            analysis=store.commit_message(it.commit) if it.index else None,
             parent=it.parent,
-            diff=store.diff(it.commit) if it.index else None,
+            diff=store.commit_diff(it.commit) if it.index else None,
             result=it.result,
         )
         for it in iterations
@@ -62,7 +62,7 @@ def list_iterations(job_id: uuid.UUID, session: Session = Depends(get_session)) 
 @app.get("/jobs/{job_id}/transcript", response_model=list[MetaMessageOut])
 def get_transcript(job_id: uuid.UUID, session: Session = Depends(get_session)) -> list[MetaMessage]:
     """The meta-agent's conversation: every message, tool call, and tool output, in order."""
-    _get_job(session, job_id)
+    _job_or_404(session, job_id)
     return list(session.scalars(select(MetaMessage).where(MetaMessage.job_id == job_id).order_by(MetaMessage.seq)))
 
 
@@ -83,7 +83,7 @@ def _job_out(session: Session, job: Job) -> JobOut:
     )
 
 
-def _get_job(session: Session, job_id: uuid.UUID) -> Job:
+def _job_or_404(session: Session, job_id: uuid.UUID) -> Job:
     job = session.get(Job, job_id)
     if job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")

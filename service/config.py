@@ -14,6 +14,5 @@ META_DB_PASSWORD = os.environ.get("SERVICE_META_DB_PASSWORD", "meta_agent")
 AGENT_REPO = Path(os.environ.get("SERVICE_AGENT_REPO", Path(__file__).parent.parent / "agent_store" / "agent"))
 
 # Worker settings.
-ENV_PROVIDER = os.environ.get("SERVICE_ENV_PROVIDER", "e2b")  # Harbor --env for task sandboxes
 AGENT_MODEL = os.environ.get("AGENT_MODEL", "gpt-5.4")
 OPTIMIZER_MODEL = os.environ.get("OPTIMIZER_MODEL", "gpt-5.4")

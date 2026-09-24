@@ -70,3 +70,29 @@ class AgentRepo:
 @pytest.fixture
 def agent_repo() -> AgentRepo:
     return AgentRepo()
+
+
+class LocalBox:
+    """Stands in for an E2B sandbox: a temp directory and a local shell with no inherited secrets."""
+
+    def __init__(self):
+        self.home = tempfile.mkdtemp(prefix="box_")
+
+    def run(self, command, cwd, timeout, env=None):
+        try:
+            proc = subprocess.run(
+                ["bash", "-c", command], cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout,
+                env={"PATH": os.environ["PATH"], "HOME": self.home, **(env or {})},
+            )
+        except subprocess.TimeoutExpired as e:
+            raise TimeoutError from e
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def write(self, path, data):
+        Path(path).write_bytes(data)
+
+    def read(self, path):
+        return Path(path).read_bytes()
+
+    def close(self):
+        shutil.rmtree(self.home, ignore_errors=True)

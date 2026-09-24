@@ -306,7 +306,7 @@ workspace/
 
 ## Agent optimization service
 
-`service/` is an HTTP service that benchmarks an agent on Terminal-Bench tasks and improves it with a meta-agent. It is separate from the coding-agent loop above. It reuses `TerminalBenchRunner` from `benchmark.py` to run Harbor.
+`service/` is an HTTP service that benchmarks an agent on Terminal-Bench tasks and improves it with a meta-agent. It is separate from the coding-agent loop above. It runs Harbor through `TerminalBenchRunner` from `benchmark.py`, inside an E2B sandbox.
 
 ### Run
 
@@ -336,6 +336,8 @@ This starts 3 containers:
 
 - `worker`, which runs queued jobs
 
+On startup, the worker builds the E2B template `auto-harness-runner` in your E2B account. The first build takes about 1 minute. Later builds reuse E2B's cache.
+
 Submit a job, poll it, and print the result and iteration history:
 
 ```bash
@@ -350,8 +352,6 @@ Worker settings, all optional:
 - `AGENT_MODEL`: the model the agent uses. Default `gpt-5.4`.
 
 - `OPTIMIZER_MODEL`: the meta-agent's model. Default `gpt-5.4`. It must be an OpenAI chat model with tool calling.
-
-- `SERVICE_ENV_PROVIDER`: the Harbor `--env` for task sandboxes. Default `e2b`.
 
 ### API
 
@@ -398,7 +398,7 @@ Job `status` is `queued`, `running`, `completed`, or `crashed`. `crashed` means 
 
 The set covers 10 categories: 15 tasks are medium, 4 are hard, and 1 is easy. Expert time estimates range from 5 to 180 minutes, with a median of 60. The tasks the agent fails give the optimizer something to fix. The tasks it passes catch regressions.
 
-Harbor runs all tasks of a job in parallel and applies each task's own timeouts from its `task.toml`. The worker kills Harbor after 1 hour as a last resort.
+Harbor runs all tasks of a job in parallel and applies each task's own timeouts from its `task.toml`. `TerminalBenchRunner` kills Harbor after 1 hour as a last resort.
 
 ### Design
 
@@ -408,33 +408,39 @@ Harbor runs all tasks of a job in parallel and applies each task's own timeouts 
 
 - **3 tables** in `service/schemas.py`. `jobs` holds the request, status, and stop reason. `iterations` holds 1 row per benchmark run: commit, parent commit, and result. `meta_messages` holds the meta-agent's conversation, 1 row per message, appended as each message is added. The meta-agent can read `jobs` and `iterations` of every job.
 
-- **Loop.** The worker benchmarks the base commit as iteration 0. Then it runs a meta-agent: an OpenAI tool-calling loop in `service/optimizer.py`. The meta-agent works in a git worktree of the agent repo and has 2 tools:
+- **Loop.** The worker benchmarks the base commit as iteration 0. Then it runs a meta-agent: an OpenAI tool-calling loop in `service/optimizer.py`. Each iteration, the meta-agent gets a fresh E2B sandbox with a git checkout of the agent repo. It has 2 tools:
 
-  - `bash` runs in the worktree. The worktree shares the repo's refs, so the meta-agent can read every commit and diff. The shell gets no API keys and no database URL.
+  - `bash` runs in the checkout, in the sandbox. The worker uploads a git bundle of every ref in the agent repo, so the meta-agent can read every commit and diff. The sandbox gets no API keys and no database URL.
 
   - `sql` runs 1 read-only statement on Postgres as the role `meta_agent`. The role can read only `jobs` and `iterations`. The meta-agent can compare per-task results across commits and jobs.
 
-  The meta-agent keeps 1 conversation for the whole job. It starts by reading the agent's code and control flow. Each iteration adds 1 message: the previous iteration's outcome and the commit the worktree is at. The service keeps no notion of a best commit. The meta-agent reads commits and scores from git and the database, decides which commit to build on, and checks it out. It edits any files and ends with a text reply. The worker commits the worktree on top of the checked-out commit, with that reply as the message, and benchmarks it. Every change is committed and benchmarked, and the worktree then moves to the new commit. An attempt that fails or changes no files uses up its iteration without a commit, and the worktree is reset. The loop stops when an iteration's score reaches `target_score` or after `max_iterations` iterations. The system prompt reuses the failure checklist and the known techniques from [`program_templates/terminal_bench.md`](program_templates/terminal_bench.md).
+  The meta-agent keeps 1 conversation for the whole job. It starts by reading the agent's code and control flow. Each iteration adds 1 message: the previous iteration's outcome and the commit the checkout is at. The service keeps no notion of a best commit. The meta-agent reads commits and scores from git and the database, decides which commit to build on, and checks it out. It edits any files and ends with a text reply. The sandbox commits the checkout on top of the checked-out commit, with that reply as the message. The worker fetches the new commit into the agent repo as a git bundle, deletes the sandbox, and benchmarks the commit. Every change is committed and benchmarked, and the next iteration's checkout starts at the new commit. An attempt that fails or changes no files uses up its iteration without a commit, and the next checkout starts at the previous commit. The loop stops when an iteration's score reaches `target_score` or after `max_iterations` iterations. The system prompt reuses the failure checklist and the known techniques from [`program_templates/terminal_bench.md`](program_templates/terminal_bench.md).
 
-- **Sandbox boundary.** Harbor runs as a subprocess of the worker. Harbor creates 1 E2B sandbox per task, and the agent's commands run there. The agent's Python code (its LLM loop) runs in the Harbor process on the worker host. Harbor deletes each sandbox when its task ends.
+- **Sandbox boundary.** The worker runs no agent code. For each benchmark run, `service/runner.py` does 4 things:
 
-- **Agent load errors.** Before each run, the worker imports the entrypoint. If the import fails, every task gets status `error` with the traceback, and Harbor does not run. A change that breaks the import then scores 0, and the meta-agent can read why in the database.
+  1. It creates 1 outer E2B sandbox from the template `auto-harness-runner`: Python 3.12, git, and `harbor[e2b]==0.23.0`. The sandbox gets only `E2B_API_KEY` and `OPENAI_API_KEY`.
+
+  2. It uploads the commit as a tar, `benchmark.py`, and `service/sandbox_run.py`.
+
+  3. It runs `sandbox_run.py` in the sandbox. That script runs Harbor, which creates 1 E2B sandbox per task. The agent's Python code (its LLM loop) runs in the Harbor process in the outer sandbox. Its commands and the verifier run in the task sandboxes. Harbor deletes each task sandbox when its task ends.
+
+  4. It reads `report.json` (rewards and output tails) back and kills the outer sandbox.
+
+- **Agent load errors.** Before Harbor starts, `sandbox_run.py` imports the entrypoint in the outer sandbox. If the import fails, every task gets status `error` with the traceback, and Harbor does not run. A change that breaks the import then scores 0, and the meta-agent can read why in the database.
 
 ### Not implemented
 
 - **Multi-tenancy (Milestone 5).** There are no orgs, users, or API keys yet.
 
-- **Meta-agent isolation.** The meta-agent's `bash` runs on the worker host with the worker's user. The clean environment keeps credentials out of its shell. The shell can still read the worker's own environment through `/proc`, so this guards against accidents only. Postgres enforces the `meta_agent` role's table limits for the `sql` tool.
-
 - **Context limits.** The meta-agent's conversation grows with every tool call for the whole job. Bash output is cut to 8000 characters per call. SQL output is never cut. A long job can still exceed the model's context window, and every later iteration then fails. Summarizing earlier iterations would fix this.
 
-- **Agent code isolation.** The agent's Python code runs on the worker host, so only trusted agents are safe to submit. The fix is to run Harbor itself inside an outer sandbox. We have not verified that an E2B sandbox can create E2B sandboxes.
+- **Agent secrets and results.** The agent's code runs in the same outer sandbox as Harbor. It can read `E2B_API_KEY` and `OPENAI_API_KEY`, and it could overwrite Harbor's result files. Fixing this needs a model proxy with per-run keys, and the verifier's results read from outside the outer sandbox.
 
 - **Several agents.** The service has 1 agent repo. Supporting several needs an agent ID in the request and 1 repo per agent.
 
 - **Multiple workers.** On startup, the worker marks every `running` job as `crashed`, so only 1 worker may run. Leases with heartbeats would allow several.
 
-- **Sandbox cleanup after a kill.** Harbor creates E2B sandboxes with a 24-hour lifetime. If the worker or Harbor is killed mid-run, those sandboxes keep running until E2B stops them.
+- **Sandbox cleanup after a kill.** E2B deletes the outer sandbox 70 minutes after it starts, even if the worker died. Harbor creates task sandboxes with a 24-hour lifetime. If Harbor is killed mid-run, its task sandboxes keep running until E2B stops them.
 
 ### With more time
 

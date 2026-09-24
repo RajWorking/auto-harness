@@ -83,10 +83,10 @@ META_AGENT_TABLES = ("jobs", "iterations")
 def init_db() -> None:
     # Version 1 creates tables on startup. Schema changes require a fresh database.
     Base.metadata.create_all(engine)
-    _grant_meta_agent()
+    _create_meta_agent_role()
 
 
-def _grant_meta_agent() -> None:
+def _create_meta_agent_role() -> None:
     """Create the meta-agent's login role. It can read META_AGENT_TABLES and no other table."""
     role = sql.Identifier(META_DB_USER)
     conn = engine.raw_connection()

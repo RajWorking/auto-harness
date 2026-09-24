@@ -4,12 +4,8 @@ Ref `refs/jobs/<job_id>/<index>` keeps each iteration's commit, so `git gc` neve
 """
 
 import os
-import shutil
 import subprocess
-import tarfile
 import tempfile
-from collections.abc import Generator
-from contextlib import contextmanager
 from pathlib import Path
 
 from service.config import AGENT_REPO, OPTIMIZER_MODEL
@@ -42,65 +38,48 @@ def iteration_ref(job_id, index: int) -> str:
     return f"refs/jobs/{job_id}/{index}"
 
 
-def pin(ref: str, dest_ref: str) -> str:
+def pin_ref(ref: str, dest_ref: str) -> str:
     """Point `dest_ref` at the commit `ref` names. Return the commit hash."""
     commit = _git("rev-parse", "--verify", f"{ref}^{{commit}}").strip()
     _git("update-ref", dest_ref, commit)
     return commit
 
 
-def export(commit: str, dest: Path) -> None:
-    """Write the files of `commit` to `dest`."""
+def archive(commit: str) -> bytes:
+    """The files of `commit` as a tar archive."""
     with tempfile.TemporaryDirectory() as tmp:
-        archive = Path(tmp, "agent.tar")
-        _git("archive", "--output", str(archive), commit)
-        with tarfile.open(archive) as tar:
-            tar.extractall(dest, filter="data")
+        path = Path(tmp, "agent.tar")
+        _git("archive", "--output", str(path), commit)
+        return path.read_bytes()
 
 
-@contextmanager
-def worktree(commit: str) -> Generator[Path]:
-    """A temporary checkout of `commit`. It shares the repo's commits and refs."""
-    tmp = tempfile.mkdtemp()
-    path = Path(tmp, "agent")
-    _git("worktree", "add", "--detach", "--quiet", str(path), commit)
-    try:
-        yield path
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-        _git("worktree", "prune")
+def bundle_all() -> bytes:
+    """Every ref of the agent repo and the commits they reach, as a git bundle."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp, "all.bundle")
+        _git("bundle", "create", "--quiet", str(path), "--all")
+        return path.read_bytes()
 
 
-def head(path: Path) -> str:
-    """The commit checked out at `path`."""
-    return _git("rev-parse", "HEAD", cwd=path).strip()
+def ref_commits() -> list[str]:
+    """The commits the agent repo's refs point to."""
+    return sorted(set(_git("for-each-ref", "--format=%(objectname)").split()))
 
 
-def reset_worktree(path: Path, commit: str) -> None:
-    """Make the checkout at `path` match `commit` exactly, dropping every change and untracked file."""
-    _git("checkout", "--quiet", "--detach", "--force", commit, cwd=path)
-    _git("clean", "-fdxq", cwd=path)
+def fetch_bundle(bundle: bytes, ref: str, dest_ref: str) -> tuple[str, str]:
+    """Fetch `ref` from `bundle` into the agent repo as `dest_ref`. Return (commit, its parent)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp, "in.bundle")
+        path.write_bytes(bundle)
+        _git("fetch", "--quiet", str(path), f"{ref}:{dest_ref}")
+    commit = _git("rev-parse", "--verify", f"{dest_ref}^{{commit}}").strip()
+    return commit, _git("rev-parse", "--verify", f"{commit}^").strip()
 
 
-def commit_worktree(path: Path, message: str, dest_ref: str) -> tuple[str, str] | None:
-    """Commit the files in the checkout at `path` on top of its HEAD as `dest_ref`.
-
-    Return (new commit, parent), or None when the files match HEAD. `__pycache__` directories are never committed.
-    """
-    parent = head(path)
-    _git("add", "--all", "--", ".", ":(exclude,glob)**/__pycache__/**", cwd=path)
-    tree = _git("write-tree", cwd=path).strip()
-    if tree == _git("rev-parse", f"{parent}^{{tree}}").strip():
-        return None
-    commit = _git("commit-tree", tree, "-p", parent, "-m", message, env=OPTIMIZER_IDENTITY).strip()
-    _git("update-ref", dest_ref, commit)
-    return commit, parent
-
-
-def message(commit: str) -> str:
+def commit_message(commit: str) -> str:
     return _git("log", "-1", "--format=%B", commit).strip()
 
 
-def diff(commit: str) -> str:
+def commit_diff(commit: str) -> str:
     """Diff from the commit's parent."""
     return _git("diff", f"{commit}^", commit)

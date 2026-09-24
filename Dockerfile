@@ -13,7 +13,7 @@ RUN pip install --no-cache-dir --upgrade "pip>=25.1"
 COPY pyproject.toml pyproject.toml
 RUN pip install --no-cache-dir --group service
 
-# The worker runs Terminal-Bench through benchmark.py's TerminalBenchRunner.
+# The worker uploads benchmark.py to the outer E2B sandbox, which runs Terminal-Bench with it.
 COPY benchmark.py benchmark.py
 # The optimizer's prompt reuses guidance from the coding-agent loop's template.
 COPY program_templates/terminal_bench.md program_templates/terminal_bench.md

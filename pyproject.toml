@@ -22,7 +22,7 @@ service = [
     "pydantic>=2.7",
     "pyyaml>=6",
     "openai>=1.40",
-    "harbor[e2b]>=0.23",
+    "e2b>=2.51",  # the outer sandbox; Harbor runs inside it
     "pytest>=8",
     "httpx>=0.27",
 ]
