@@ -12,7 +12,5 @@ META_DB_USER = "meta_agent"
 META_DB_PASSWORD = os.environ.get("SERVICE_META_DB_PASSWORD", "meta_agent")
 # Git clone of the agent being optimized. The operator clones it here before starting the service.
 AGENT_REPO = Path(os.environ.get("SERVICE_AGENT_REPO", Path(__file__).parent.parent / "agent_store" / "agent"))
-
-# Worker settings.
 AGENT_MODEL = os.environ.get("AGENT_MODEL", "gpt-5.4")
 OPTIMIZER_MODEL = os.environ.get("OPTIMIZER_MODEL", "gpt-5.4")

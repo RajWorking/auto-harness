@@ -78,11 +78,11 @@ class LocalBox:
     def __init__(self):
         self.home = tempfile.mkdtemp(prefix="box_")
 
-    def run(self, command, cwd, timeout, env=None):
+    def run(self, command, cwd, timeout):
         try:
             proc = subprocess.run(
                 ["bash", "-c", command], cwd=cwd, capture_output=True, text=True, errors="replace", timeout=timeout,
-                env={"PATH": os.environ["PATH"], "HOME": self.home, **(env or {})},
+                env={"PATH": os.environ["PATH"], "HOME": self.home},
             )
         except subprocess.TimeoutExpired as e:
             raise TimeoutError from e

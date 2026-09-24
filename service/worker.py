@@ -56,9 +56,8 @@ def _optimize(
 ) -> RunResult:
     """Run the improvement iterations. Return the latest benchmark result.
 
-    The meta-agent keeps 1 conversation for the whole job. Each iteration adds 1 message to it and gives
-    the meta-agent a fresh sandbox with a checkout of the agent repo. The meta-agent picks the commit to
-    build on by checking it out. Every change is committed on top of the checked-out commit and benchmarked.
+    Each iteration gives the meta-agent a fresh sandbox with a checkout of the agent repo. The meta-agent
+    picks the commit to build on by checking it out. Every change is committed on top of it and benchmarked.
     """
     transcript = _TranscriptWriter(job.id)
     meta = meta_agent(transcript)
@@ -94,15 +93,11 @@ def _optimize(
 
 
 class _TranscriptWriter:
-    """Appends each meta-agent message to `meta_messages` as soon as it is added to the conversation.
-
-    Each write uses its own session. A failed write loses that row only: the job's session and the
-    meta-agent's conversation continue.
-    """
+    """Appends each meta-agent message to `meta_messages`. A failed write loses only that row."""
 
     def __init__(self, job_id):
         self.job_id = job_id
-        self.iteration = 0  # the system prompt comes before iteration 1
+        self.iteration = 0  # the system prompt
         self.seq = 0
 
     def __call__(self, message: dict) -> None:

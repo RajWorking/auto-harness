@@ -1,4 +1,5 @@
 from service import store
+from service.config import OPTIMIZER_MODEL
 from service.checkout import Checkout
 from service.tests.conftest import LocalBox
 
@@ -13,7 +14,7 @@ def test_checkout_has_every_ref_and_no_secrets(agent_repo, monkeypatch):
     store.pin_ref("main", "refs/jobs/x/0")
     work = open_local(base)
 
-    assert work.head() == base
+    assert work.bash("git rev-parse HEAD") == f"{base}\n[exit code 0]"
     assert "refs/jobs/x/0" in work.bash("git for-each-ref")
     out = work.bash("pwd; env")
     assert work.path in out and "secret" not in out and "SERVICE_DATABASE_URL" not in out
@@ -35,6 +36,7 @@ def test_commit_comes_back_into_the_agent_repo(agent_repo):
     assert store._git("rev-parse", "refs/jobs/x/1").strip() == commit
     assert store._git("ls-tree", "-r", "--name-only", commit).split() == ["data.bin"]
     assert store.commit_message(commit) == "rewrite"
+    assert store._git("log", "-1", "--format=%an", commit).strip() == OPTIMIZER_MODEL
 
 
 def test_commit_on_the_meta_agents_own_commit(agent_repo):

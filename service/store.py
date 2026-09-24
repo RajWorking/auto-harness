@@ -3,31 +3,20 @@
 Ref `refs/jobs/<job_id>/<index>` keeps each iteration's commit, so `git gc` never deletes it.
 """
 
-import os
 import subprocess
 import tempfile
 from pathlib import Path
 
-from service.config import AGENT_REPO, OPTIMIZER_MODEL
-
-# The meta-agent's model authors each change. The service commits it.
-OPTIMIZER_IDENTITY = {
-    "GIT_AUTHOR_NAME": OPTIMIZER_MODEL, "GIT_AUTHOR_EMAIL": "optimizer@localhost",
-    "GIT_COMMITTER_NAME": "optimizer", "GIT_COMMITTER_EMAIL": "optimizer@localhost",
-}
+from service.config import AGENT_REPO
 
 
 class GitError(Exception):
     pass
 
 
-def _git(*args: str, cwd: Path = AGENT_REPO, env: dict | None = None) -> str:
+def _git(*args: str) -> str:
     try:
-        return subprocess.run(
-            ["git", "-C", str(cwd), *args],
-            capture_output=True, text=True, check=True, timeout=120,
-            env={**os.environ, **(env or {})},
-        ).stdout
+        return subprocess.run(["git", "-C", str(AGENT_REPO), *args], capture_output=True, text=True, check=True, timeout=120).stdout
     except subprocess.CalledProcessError as e:
         raise GitError(e.stderr.strip()) from e
     except subprocess.TimeoutExpired as e:
@@ -61,17 +50,12 @@ def bundle_all() -> bytes:
         return path.read_bytes()
 
 
-def ref_commits() -> list[str]:
-    """The commits the agent repo's refs point to."""
-    return sorted(set(_git("for-each-ref", "--format=%(objectname)").split()))
-
-
-def fetch_bundle(bundle: bytes, ref: str, dest_ref: str) -> tuple[str, str]:
-    """Fetch `ref` from `bundle` into the agent repo as `dest_ref`. Return (commit, its parent)."""
+def fetch_bundle(bundle: bytes, dest_ref: str) -> tuple[str, str]:
+    """Fetch the bundle's HEAD into the agent repo as `dest_ref`. Return (commit, its parent)."""
     with tempfile.TemporaryDirectory() as tmp:
-        path = Path(tmp, "in.bundle")
+        path = Path(tmp, "out.bundle")
         path.write_bytes(bundle)
-        _git("fetch", "--quiet", str(path), f"{ref}:{dest_ref}")
+        _git("fetch", "--quiet", str(path), f"HEAD:{dest_ref}")
     commit = _git("rev-parse", "--verify", f"{dest_ref}^{{commit}}").strip()
     return commit, _git("rev-parse", "--verify", f"{commit}^").strip()
 

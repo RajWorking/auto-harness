@@ -13,20 +13,14 @@ MAX_STEPS = 40  # tool-calling rounds per iteration
 OUTPUT_CHARS = 8000  # bash output kept per call
 # The `sql` tool connects as the meta-agent's role, so Postgres rejects every table outside META_AGENT_TABLES.
 meta_engine = create_engine(engine.url.set(username=META_DB_USER, password=META_DB_PASSWORD), pool_pre_ping=True)
-# Guidance written for the repo's coding-agent loop (see prepare.py), reused here.
+# Guidance written for the repo's coding-agent loop, reused here.
 PROGRAM_TEMPLATE = Path(__file__).parent.parent / "program_templates" / "terminal_bench.md"
 
 
 def _template_items(heading: str) -> str:
-    """The bullet and numbered lines under `### <heading>` in PROGRAM_TEMPLATE."""
-    parts = PROGRAM_TEMPLATE.read_text().split(f"\n### {heading}\n")
-    if len(parts) != 2:
-        raise ValueError(f"{PROGRAM_TEMPLATE} has no section '### {heading}'")
-    section = parts[1].split("\n### ")[0]
-    items = [line for line in section.splitlines() if line.startswith("- ") or line[:1].isdigit()]
-    if not items:
-        raise ValueError(f"section '### {heading}' in {PROGRAM_TEMPLATE} has no list items")
-    return "\n".join(items)
+    """The bullet and numbered lines under `### <heading>` in PROGRAM_TEMPLATE. Raises IndexError if the heading is missing."""
+    section = PROGRAM_TEMPLATE.read_text().split(f"\n### {heading}\n")[1].split("\n### ")[0]
+    return "\n".join(line for line in section.splitlines() if line.startswith("- ") or line[:1].isdigit())
 
 
 def _schema() -> str:
@@ -36,7 +30,6 @@ def _schema() -> str:
     )
 
 
-# Built at import, so a renamed template section stops the worker at startup.
 SYSTEM_PROMPT = f"""You improve an AI agent that solves Terminal-Bench tasks in a Linux sandbox.
 Your working directory is a git checkout of the agent. At the start of the job, before changing anything,
 read the agent's code and its control flow: how it calls the model, how it runs commands, and when it stops.
@@ -70,39 +63,19 @@ individual tasks. Keep the entrypoint's class name and interface.
 When the change is done, reply without a tool call: the cause you found and the change you made,
 in a few sentences. That reply becomes the commit message."""
 
+def _tool_spec(name: str, arg: str, description: str) -> dict:
+    parameters = {"type": "object", "properties": {arg: {"type": "string"}}, "required": [arg]}
+    return {"type": "function", "function": {"name": name, "description": description, "parameters": parameters}}
+
+
 TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "bash",
-            "description": "Run a bash command in the agent checkout. Returns stdout, stderr, and the exit code.",
-            "parameters": {
-                "type": "object",
-                "properties": {"command": {"type": "string"}},
-                "required": ["command"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "sql",
-            "description": "Run 1 read-only SQL statement on the service's Postgres. Returns every row as JSON.",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": ["query"],
-            },
-        },
-    },
+    _tool_spec("bash", "command", "Run a bash command in the agent checkout. Returns stdout, stderr, and the exit code."),
+    _tool_spec("sql", "query", "Run 1 read-only SQL statement on the service's Postgres. Returns every row as JSON."),
 ]
 
 
 class MetaAgent:
-    """A tool-using LLM that improves the agent. It keeps 1 conversation for the whole job.
-
-    `record` receives every message as it is added to the conversation.
-    """
+    """A tool-using LLM that improves the agent. It keeps 1 conversation for the whole job and passes each message to `record`."""
 
     def __init__(self, record: Callable[[dict], None]):
         self.record = record
@@ -111,10 +84,7 @@ class MetaAgent:
         self._add({"role": "system", "content": SYSTEM_PROMPT})
 
     def run(self, message: str, work: Checkout) -> str:
-        """Add `message` to the conversation and work in `work` until the model replies without a tool call.
-
-        Return that reply.
-        """
+        """Add `message` and work in `work` until the model replies without a tool call. Return that reply."""
         self._add({"role": "user", "content": message})
         for _ in range(MAX_STEPS):
             reply = self.client.chat.completions.create(model=OPTIMIZER_MODEL, messages=self.messages, tools=TOOLS)
